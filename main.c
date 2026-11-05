@@ -533,15 +533,30 @@ static void reset_helicopter(void)
 
 static void draw_cloud(int x, int y)
 {
-    draw_line(x, y, x+45, y+35);
-    draw_line(x+45, y+35, x+90, y+55);
-    draw_line(x+90, y+55, x+135, y+35);
-    draw_line(x+135, y+35, x+180, y);
-    draw_line(x+180, y, x+220, y);
+    /*
+     * Draw three closely spaced cloud outlines. The parallel outlines
+     * make the cloud visibly thicker on the XY DSO without changing
+     * its overall collision envelope significantly.
+     */
+    int offset;
 
-    draw_line(x+220, y, x+170, y-20);
-    draw_line(x+170, y-20, x+70, y-20);
-    draw_line(x+70, y-20, x, y);
+    for (offset = -18; offset <= 18; offset += 18)
+    {
+        draw_line(x, y + offset, x+45, y+35 + offset);
+        draw_line(x+45, y+35 + offset,
+                  x+90, y+55 + offset);
+        draw_line(x+90, y+55 + offset,
+                  x+135, y+35 + offset);
+        draw_line(x+135, y+35 + offset,
+                  x+180, y + offset);
+        draw_line(x+180, y + offset, x+220, y + offset);
+
+        draw_line(x+220, y + offset,
+                  x+170, y-20 + offset);
+        draw_line(x+170, y-20 + offset,
+                  x+70, y-20 + offset);
+        draw_line(x+70, y-20 + offset, x, y + offset);
+    }
 }
 
 static void draw_tree(int x, int base, int height)
@@ -676,9 +691,9 @@ static void reset_map(void)
 }
 
 /* =====================================================
-   COLLISION DETECTION (NOT USED IN THIS VERSION)
-   The routine is retained for later re-enabling, but game_tick()
-   does not call it, so it cannot end the game.
+   COLLISION DETECTION
+   Checks screen limits, ground, clouds and tree obstacles.
+   Called after each helicopter/map movement update.
    ===================================================== */
 
 static uint8 check_collision(void)
@@ -700,6 +715,32 @@ static uint8 check_collision(void)
 
     if (hy_bottom <= GROUND_Y)
         return 1;
+
+    /* Cloud collision.
+       Cloud drawing envelope: x .. x+220, y-38 .. y+73.
+       Check the same wrapped map copies used by the drawing routine. */
+    for (i = 0; i < CLOUD_COUNT; i++)
+    {
+        int k;
+
+        for (k = -1; k <= 1; k++)
+        {
+            int cx = X_MIN + clouds[i].x
+                     + k*MAP_LENGTH - map_scroll;
+            int cloud_left = cx;
+            int cloud_right = cx + 220;
+            int cloud_bottom = clouds[i].y - 38;
+            int cloud_top = clouds[i].y + 73;
+
+            if (hx_right > cloud_left &&
+                hx_left < cloud_right &&
+                hy_bottom < cloud_top &&
+                hy_top > cloud_bottom)
+            {
+                return 1;
+            }
+        }
+    }
 
     /* Tree collision */
 
@@ -764,9 +805,9 @@ static void start_game_over(void)
 
 /* =====================================================
    GAME TIMING
-   Called once for every elapsed 10 ms timer tick.
-   Helicopter movement and map scrolling update every 50 ms.
-   Collision detection is disabled in this version.
+   Called once for every 10 ms software game tick.
+   Helicopter movement, map scrolling and collision checks
+   are performed every 50 ms.
    ===================================================== */
 
 static void game_tick(void)
@@ -789,11 +830,19 @@ static void game_tick(void)
              *   Pin_3 LOW  -> switch_pressed = 1 -> move UP
              *   Pin_3 HIGH -> switch_pressed = 0 -> move DOWN
              *
-             * Movement is updated every 50 ms (5 x 10 ms game ticks).
-             * Collision detection is intentionally disabled for now.
+             * Movement and map scrolling update every 50 ms.
              */
             update_helicopter();
             update_map();
+
+            /* Check collision after updating both helicopter and map.
+               This detects contact with the ground, screen boundaries
+               and tree obstacles using the current frame coordinates. */
+            if (check_collision())
+            {
+                start_game_over();
+                return;
+            }
 
             /* Debug: verify that the CPU is changing the helicopter Y. */
             uart_number("HELI Y: ", (uint32_t)helicopter_y);
@@ -1153,7 +1202,7 @@ int main(void)
     uart_print("GAME TIMER READY: SOFTWARE 10 ms TICK\r\n");
     uart_print("GAME INITIALIZED - WAITING FOR SWITCH\r\n");
     uart_print("HELICOPTER CONTROL: PRESS=UP, RELEASE=DOWN\r\n");
-    uart_print("MOVEMENT UPDATE: 50 ms; COLLISION DETECTION DISABLED\r\n");
+    uart_print("MOVEMENT UPDATE: 50 ms; COLLISION DETECTION ENABLED\r\n");
 
     CyGlobalIntEnable;
 
