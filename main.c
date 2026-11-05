@@ -676,7 +676,9 @@ static void reset_map(void)
 }
 
 /* =====================================================
-   COLLISION DETECTION
+   COLLISION DETECTION (NOT USED IN THIS VERSION)
+   The routine is retained for later re-enabling, but game_tick()
+   does not call it, so it cannot end the game.
    ===================================================== */
 
 static uint8 check_collision(void)
@@ -762,7 +764,9 @@ static void start_game_over(void)
 
 /* =====================================================
    GAME TIMING
-   Called once for every elapsed 10 ms timer tick
+   Called once for every elapsed 10 ms timer tick.
+   Helicopter movement and map scrolling update every 50 ms.
+   Collision detection is disabled in this version.
    ===================================================== */
 
 static void game_tick(void)
@@ -780,14 +784,19 @@ static void game_tick(void)
         {
             move_counter = 0;
 
+            /*
+             * Helicopter movement:
+             *   Pin_3 LOW  -> switch_pressed = 1 -> move UP
+             *   Pin_3 HIGH -> switch_pressed = 0 -> move DOWN
+             *
+             * Movement is updated every 50 ms (5 x 10 ms game ticks).
+             * Collision detection is intentionally disabled for now.
+             */
             update_helicopter();
             update_map();
 
-            if (check_collision())
-            {
-                start_game_over();
-                return;
-            }
+            /* Debug: verify that the CPU is changing the helicopter Y. */
+            uart_number("HELI Y: ", (uint32_t)helicopter_y);
         }
 
         /* Score increases every second */
@@ -853,9 +862,16 @@ static void draw_gameplay_screen(void)
 
     draw_number(score, 600, 3500, 55);
 
-    draw_map();
-
+    /*
+     * Draw the helicopter FIRST. The DMA frame buffer is limited to
+     * MAX_POINTS samples. The map contains many line segments and can
+     * otherwise fill the buffer before the helicopter is added.
+     * Keeping the helicopter first guarantees that its latest Y position
+     * is present in every gameplay frame.
+     */
     draw_helicopter();
+
+    draw_map();
 }
 
 /* =====================================================
@@ -1080,9 +1096,6 @@ static void service_dma_graphics(void)
 
 int main(void)
 {
-    uint32_t current_ticks;
-    uint32_t previous_ticks = 0u;
-    uint32_t elapsed_ticks;
     uint8 event;
     uint8 log_event;
     uint8 log_state;
@@ -1106,7 +1119,6 @@ int main(void)
 
     uart_print("GPIO SWITCH READY - P2[2] ACTIVE LOW\r\n");
 
-    /* Initialize game state BEFORE enabling the game timer interrupt. */
     reset_helicopter();
     reset_map();
     score = 0u;
@@ -1117,21 +1129,13 @@ int main(void)
     switch_event = 0u;
     switch_log_event = 0u;
 
-    /*
-     * Initialize debounce state from the actual pin level.
-     * This avoids assuming that the switch is released at boot.
-     * It does NOT create a false press event during startup.
-     */
     previous_switch_state = Pin_3_Read();
     candidate_switch_state = previous_switch_state;
     debounce_counter = 0u;
-
     game_state = SCREEN_START;
 
-    /* Start the 1 MHz DAC clock; Timer_DAC stays stopped until playback. */
     Clock_DAC_Start();
 
-    /* Initialize DMA completion ISRs and DMA channels. */
     isr_dma_x_StartEx(DMA_X_ISR);
     isr_dma_y_StartEx(DMA_Y_ISR);
     dma_init();
@@ -1139,43 +1143,29 @@ int main(void)
     uart_print("DMA CHANNELS INITIALIZED\r\n");
     uart_print("DAC DMA TIMER READY: 50 kHz\r\n");
 
-    /*
-     * IMPORTANT ORDER:
-     * 1. Start the ISR component.
-     * 2. Start the timer clock.
-     * 3. Start Timer_1.
-     *
-     * This prevents the timer from running before its ISR is attached.
-     */
+    /* Keep Timer_1 configured for diagnostics, but do not rely on its ISR
+       for game movement in this version. The main loop supplies the 10 ms
+       game tick so movement remains functional if Timer_1 is not firing. */
     isr_1_StartEx(Timer_ISR);
     Clock_2_Start();
     Timer_1_Start();
 
-    uart_print("GAME TIMER READY: 10 ms\r\n");
+    uart_print("GAME TIMER READY: SOFTWARE 10 ms TICK\r\n");
     uart_print("GAME INITIALIZED - WAITING FOR SWITCH\r\n");
+    uart_print("HELICOPTER CONTROL: PRESS=UP, RELEASE=DOWN\r\n");
+    uart_print("MOVEMENT UPDATE: 50 ms; COLLISION DETECTION DISABLED\r\n");
 
-    /* Enable interrupts only after all ISR state is initialized. */
     CyGlobalIntEnable;
 
-    /* Prepare the first frame. */
     render_one_free_buffer();
 
     for (;;)
     {
-        /*
-         * Preserve the working non-DMA polling behaviour:
-         * sample the physical GPIO continuously from main().
-         * plot() also samples it while the CPU builds a frame.
-         */
+        /* Preserve the working non-DMA GPIO polling method. */
         scan_switch();
 
-        /*
-         * Take a short atomic snapshot.
-         * Switch scanning and debounce run in main context.
-         * The timer ISR only updates timer_ticks.
-         */
+        /* Atomically consume switch and UART-log events. */
         CyGlobalIntDisable;
-        current_ticks = timer_ticks;
         event = switch_event;
         switch_event = 0u;
         log_event = switch_log_event;
@@ -1191,23 +1181,19 @@ int main(void)
                 uart_print("SWITCH RELEASED\r\n");
         }
 
-        elapsed_ticks = current_ticks - previous_ticks;
-        previous_ticks = current_ticks;
-
-        while (elapsed_ticks > 0u)
-        {
-            elapsed_ticks--;
-            game_tick();
-        }
-
-        if (game_state == SCREEN_START && event)
+        if ((game_state == SCREEN_START) && event)
         {
             reset_game();
             game_state = SCREEN_GAMEPLAY;
             uart_state("GAMEPLAY SCREEN");
         }
 
-        /* Service completed DMA frame and prepare the next graphics frame. */
+        /* One software game tick per 10 ms. DMA continues autonomously
+           while the CPU waits; interrupts remain enabled during CyDelay. */
+        CyDelay(10u);
+        game_tick();
+
+        /* Service DMA frequently so completed frames are replaced. */
         service_dma_graphics();
     }
 }
