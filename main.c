@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
 
 /* =====================================================
    HELICOPTER GAME - PSoC 5LP CY8C5888
@@ -11,7 +12,9 @@
    VDAC8_2 : Y output
    UART_1  : Serial debugging
    Pin_3   : P2[2], active LOW switch
-   Timer_1 : 10 ms interrupt
+   Timer_1   : 10 ms game interrupt (1 kHz clock, period 9)
+   Timer_DAC : 50 kHz DMA sample trigger (1 MHz clock, period 19)
+   DMA_X/Y   : Buffered X/Y coordinate playback
    ===================================================== */
 
 /* DISPLAY */
@@ -23,7 +26,10 @@
 
 #define DAC_MAX             4095
 #define DRAW_STEP           12
-#define DAC_DELAY           5
+
+/* DMA frame buffer. A PSoC DMA TD is limited to 4095 bytes. */
+#define MAX_POINTS          4000u
+#define DMA_SAMPLE_HZ       50000u
 
 /* MAP */
 
@@ -71,6 +77,33 @@ typedef enum
     SCREEN_GAMEPLAY,
     SCREEN_GAME_OVER
 } GameState;
+
+/* =====================================================
+   DMA GRAPHICS BUFFERS
+   ===================================================== */
+
+typedef struct
+{
+    uint8 x[MAX_POINTS];
+    uint8 y[MAX_POINTS];
+    uint16 count;
+} GraphicsBuffer;
+
+/* Keep both buffers in SRAM. DMA reads one while CPU fills the other. */
+static GraphicsBuffer graphics_buffer[2];
+static volatile uint8 buffer_ready[2] = {0u, 0u};
+static volatile uint8 dma_playing = 0u;
+static volatile uint8 dma_buffer_index = 0u;
+static volatile uint8 dma_x_done = 0u;
+static volatile uint8 dma_y_done = 0u;
+static volatile uint8 dma_frame_done = 0u;
+static GraphicsBuffer *active_buffer = NULL;
+
+/* DMA channel and transaction descriptor handles. */
+static uint8 DMA_X_Chan;
+static uint8 DMA_Y_Chan;
+static uint8 DMA_X_TD;
+static uint8 DMA_Y_TD;
 
 /* =====================================================
    MAP DATA
@@ -174,62 +207,57 @@ static void uart_state(const char *message)
 }
 
 /* =====================================================
-   CONTINUOUS GPIO SWITCH SCANNING
+   SWITCH SCANNING AND DEBOUNCING
 
-   Pin_3 = P2[2]
+   Pin_3 = P2[2], active LOW
    HIGH = Released
    LOW  = Pressed
 
-   This function is called from:
-   1. Main loop
-   2. DAC plotting function
+   IMPORTANT:
+   The working non-DMA version scanned the GPIO from the
+   main loop and from plot(). Preserve that behaviour here.
+   DMA only changes how DAC coordinates are output; it must
+   not move switch detection into the timer/DMA interrupt.
 
-   Therefore, GPIO is checked during drawing too.
+   scan_switch() is therefore called only in main context:
+   - once on every main-loop pass
+   - while CPU is building a graphics frame in plot()
+
+   No UART calls are made from an ISR.
    ===================================================== */
+
+static volatile uint8 switch_log_event = 0u;
+static volatile uint8 switch_log_state = 1u;
 
 static void scan_switch(void)
 {
-    uint8 raw_state;
-
-    raw_state = Pin_3_Read();
-
-    /* Check whether raw input has changed */
+    uint8 raw_state = Pin_3_Read();
 
     if (raw_state != candidate_switch_state)
     {
         candidate_switch_state = raw_state;
-        debounce_counter = 0;
+        debounce_counter = 0u;
         return;
     }
 
-    /* Require 3 consecutive timer samples */
-
     if (debounce_counter < DEBOUNCE_TICKS)
-    {
         debounce_counter++;
-    }
 
-    if (debounce_counter >= DEBOUNCE_TICKS)
+    if ((debounce_counter >= DEBOUNCE_TICKS) &&
+        (candidate_switch_state != previous_switch_state))
     {
-        /* Accept only a confirmed state change */
+        previous_switch_state = candidate_switch_state;
+        switch_log_state = previous_switch_state;
+        switch_log_event = 1u;
 
-        if (candidate_switch_state != previous_switch_state)
+        if (previous_switch_state == 0u)
         {
-            previous_switch_state = candidate_switch_state;
-
-            if (previous_switch_state == 0)
-            {
-                switch_pressed = 1;
-                switch_event = 1;
-
-                uart_print("SWITCH PRESSED\r\n");
-            }
-            else
-            {
-                switch_pressed = 0;
-
-                uart_print("SWITCH RELEASED\r\n");
-            }
+            switch_pressed = 1u;
+            switch_event = 1u;
+        }
+        else
+        {
+            switch_pressed = 0u;
         }
     }
 }
@@ -258,20 +286,24 @@ static uint8 convert_dac(int value)
 
 static void plot(int x, int y)
 {
-    /* Continuously scan GPIO during drawing */
+    uint16 index;
 
+    /* Keep the same GPIO polling point as the working non-DMA code. */
     scan_switch();
 
-    if (x < X_MIN || x > X_MAX ||
-        y < Y_MIN || y > Y_MAX)
-    {
+    if (active_buffer == NULL)
         return;
-    }
 
-    VDAC8_1_SetValue(convert_dac(x));
-    VDAC8_2_SetValue(convert_dac(y));
+    if (x < X_MIN || x > X_MAX || y < Y_MIN || y > Y_MAX)
+        return;
 
-    CyDelayUs(DAC_DELAY);
+    if (active_buffer->count >= MAX_POINTS)
+        return;
+
+    index = active_buffer->count;
+    active_buffer->x[index] = convert_dac(x);
+    active_buffer->y[index] = convert_dac(y);
+    active_buffer->count++;
 }
 
 /* =====================================================
@@ -877,11 +909,169 @@ static void draw_current_screen(void)
 
 CY_ISR(Timer_ISR)
 {
+    /* Clear the Timer_1 terminal-count interrupt source. */
     Timer_1_ReadStatusRegister();
 
+    /* One tick every 10 ms. Switch scanning is kept in main context. */
     timer_ticks++;
+}
 
-    scan_switch();
+/* DMA_X nrq and DMA_Y nrq must each connect to a separate ISR component. */
+CY_ISR(DMA_X_ISR)
+{
+    isr_dma_x_ClearPending();
+    dma_x_done = 1u;
+
+    if (dma_y_done)
+    {
+        Timer_DAC_Stop();
+        dma_frame_done = 1u;
+    }
+}
+
+CY_ISR(DMA_Y_ISR)
+{
+    isr_dma_y_ClearPending();
+    dma_y_done = 1u;
+
+    if (dma_x_done)
+    {
+        Timer_DAC_Stop();
+        dma_frame_done = 1u;
+    }
+}
+
+/* Initialize DMA channels. DMA_X/Y component names must match the schematic. */
+static void dma_init(void)
+{
+    DMA_X_Chan = DMA_X_DmaInitialize(
+        1u, 1u,
+        HI16((uint32)graphics_buffer[0].x),
+        HI16((uint32)VDAC8_1_Data_PTR));
+
+    DMA_Y_Chan = DMA_Y_DmaInitialize(
+        1u, 1u,
+        HI16((uint32)graphics_buffer[0].y),
+        HI16((uint32)VDAC8_2_Data_PTR));
+
+    DMA_X_TD = CyDmaTdAllocate();
+    DMA_Y_TD = CyDmaTdAllocate();
+
+    if (DMA_X_Chan == DMA_INVALID_CHANNEL ||
+        DMA_Y_Chan == DMA_INVALID_CHANNEL ||
+        DMA_X_TD == DMA_INVALID_TD || DMA_Y_TD == DMA_INVALID_TD)
+    {
+        uart_state("DMA ALLOCATION ERROR");
+        for (;;) { }
+    }
+}
+
+/* Configure and start one finite X/Y frame. Timer_DAC starts only after
+   both DMA channels are armed, so the first sample is not lost. */
+static uint8 start_dma_frame(uint8 index)
+{
+    uint16 count = graphics_buffer[index].count;
+
+    if (count == 0u || count > MAX_POINTS)
+        return 0u;
+
+    Timer_DAC_Stop();
+
+    CyDmaChDisable(DMA_X_Chan);
+    CyDmaChDisable(DMA_Y_Chan);
+    CyDmaClearPendingDrq(DMA_X_Chan);
+    CyDmaClearPendingDrq(DMA_Y_Chan);
+
+    dma_x_done = 0u;
+    dma_y_done = 0u;
+    dma_frame_done = 0u;
+    dma_buffer_index = index;
+
+    CyDmaTdSetConfiguration(
+        DMA_X_TD, count, DMA_INVALID_TD,
+        DMA_X__TD_TERMOUT_EN | TD_INC_SRC_ADR);
+    CyDmaTdSetAddress(
+        DMA_X_TD,
+        LO16((uint32)graphics_buffer[index].x),
+        LO16((uint32)VDAC8_1_Data_PTR));
+
+    CyDmaTdSetConfiguration(
+        DMA_Y_TD, count, DMA_INVALID_TD,
+        DMA_Y__TD_TERMOUT_EN | TD_INC_SRC_ADR);
+    CyDmaTdSetAddress(
+        DMA_Y_TD,
+        LO16((uint32)graphics_buffer[index].y),
+        LO16((uint32)VDAC8_2_Data_PTR));
+
+    CyDmaChSetInitialTd(DMA_X_Chan, DMA_X_TD);
+    CyDmaChSetInitialTd(DMA_Y_Chan, DMA_Y_TD);
+
+    CyDmaChEnable(DMA_X_Chan, 1u);
+    CyDmaChEnable(DMA_Y_Chan, 1u);
+
+    dma_playing = 1u;
+    Timer_DAC_Start();
+    return 1u;
+}
+
+/* Render into a buffer that DMA is not currently reading and which is not
+   already queued for playback. */
+static uint8 render_one_free_buffer(void)
+{
+    uint8 index;
+
+    for (index = 0u; index < 2u; index++)
+    {
+        if (!buffer_ready[index] &&
+            (!dma_playing || index != dma_buffer_index))
+        {
+            graphics_buffer[index].count = 0u;
+            active_buffer = &graphics_buffer[index];
+            draw_current_screen();
+            active_buffer = NULL;
+
+            if (graphics_buffer[index].count == 0u)
+                return 0u;
+
+            buffer_ready[index] = 1u;
+            return 1u;
+        }
+    }
+
+    return 0u;
+}
+
+static void service_dma_graphics(void)
+{
+    uint8 index;
+
+    if (dma_frame_done)
+    {
+        CyGlobalIntDisable;
+        dma_frame_done = 0u;
+        dma_playing = 0u;
+        buffer_ready[dma_buffer_index] = 0u;
+        CyGlobalIntEnable;
+    }
+
+    if (!dma_playing)
+    {
+        if (buffer_ready[0])
+            index = 0u;
+        else if (buffer_ready[1])
+            index = 1u;
+        else
+        {
+            render_one_free_buffer();
+            return;
+        }
+
+        if (start_dma_frame(index))
+            return;
+    }
+
+    /* While DMA plays one buffer, CPU renders the other. */
+    render_one_free_buffer();
 }
 
 /* =====================================================
@@ -891,122 +1081,133 @@ CY_ISR(Timer_ISR)
 int main(void)
 {
     uint32_t current_ticks;
-    uint32_t previous_ticks = 0;
+    uint32_t previous_ticks = 0u;
     uint32_t elapsed_ticks;
-
     uint8 event;
+    uint8 log_event;
+    uint8 log_state;
 
-    CyGlobalIntEnable;
-
-    /* UART initialization */
+    /* Keep global interrupts disabled while components and state are set up. */
+    CyGlobalIntDisable;
 
     UART_1_Start();
+    CyDelay(500u);
 
-    CyDelay(500);
-
-    uart_print("\r\n");
-    uart_print("================================\r\n");
+    uart_print("\r\n================================\r\n");
     uart_print("HELICOPTER GAME BY ANAND AND JIJO\r\n");
-    uart_print("PSoC 5LP INITIALIZATION\r\n");
+    uart_print("PSoC 5LP CPU + DMA GRAPHICS\r\n");
     uart_print("================================\r\n");
-
-    /* DAC initialization */
 
     VDAC8_1_Start();
     VDAC8_2_Start();
+    VDAC8_1_SetValue(0u);
+    VDAC8_2_SetValue(0u);
+    uart_print("VDAC8 CHANNELS READY\r\n");
 
-    uart_print("VDAC8_1 READY\r\n");
-    uart_print("VDAC8_2 READY\r\n");
+    uart_print("GPIO SWITCH READY - P2[2] ACTIVE LOW\r\n");
 
-    /* Switch initialization */
-
-    uart_print("GPIO SWITCH READY\r\n");
-    uart_print("PIN: P2[2]\r\n");
-
-    /* Timer initialization */
-
-    Timer_1_Start();
-
-    isr_1_StartEx(Timer_ISR);
-
-    uart_print("TIMER READY\r\n");
-
-    /* Game initialization */
-
+    /* Initialize game state BEFORE enabling the game timer interrupt. */
     reset_helicopter();
     reset_map();
+    score = 0u;
+    previous_score = 0u;
+    game_over_ticks = 0u;
+    timer_ticks = 0u;
+    switch_pressed = 0u;
+    switch_event = 0u;
+    switch_log_event = 0u;
 
-    score = 0;
-    previous_score = 0;
-    game_over_ticks = 0;
-
-    switch_pressed = 0;
-    switch_event = 0;
-    previous_switch_state = 1;
+    /*
+     * Initialize debounce state from the actual pin level.
+     * This avoids assuming that the switch is released at boot.
+     * It does NOT create a false press event during startup.
+     */
+    previous_switch_state = Pin_3_Read();
+    candidate_switch_state = previous_switch_state;
+    debounce_counter = 0u;
 
     game_state = SCREEN_START;
 
-    uart_print("GAME INITIALIZED\r\n");
-    uart_print("WAITING FOR SWITCH PRESS\r\n");
-    uart_print("================================\r\n");
+    /* Start the 1 MHz DAC clock; Timer_DAC stays stopped until playback. */
+    Clock_DAC_Start();
 
-    /* =================================================
-       MAIN LOOP
-       ================================================= */
+    /* Initialize DMA completion ISRs and DMA channels. */
+    isr_dma_x_StartEx(DMA_X_ISR);
+    isr_dma_y_StartEx(DMA_Y_ISR);
+    dma_init();
+
+    uart_print("DMA CHANNELS INITIALIZED\r\n");
+    uart_print("DAC DMA TIMER READY: 50 kHz\r\n");
+
+    /*
+     * IMPORTANT ORDER:
+     * 1. Start the ISR component.
+     * 2. Start the timer clock.
+     * 3. Start Timer_1.
+     *
+     * This prevents the timer from running before its ISR is attached.
+     */
+    isr_1_StartEx(Timer_ISR);
+    Clock_2_Start();
+    Timer_1_Start();
+
+    uart_print("GAME TIMER READY: 10 ms\r\n");
+    uart_print("GAME INITIALIZED - WAITING FOR SWITCH\r\n");
+
+    /* Enable interrupts only after all ISR state is initialized. */
+    CyGlobalIntEnable;
+
+    /* Prepare the first frame. */
+    render_one_free_buffer();
 
     for (;;)
     {
         /*
-         * 1. Continuously scan physical GPIO.
+         * Preserve the working non-DMA polling behaviour:
+         * sample the physical GPIO continuously from main().
+         * plot() also samples it while the CPU builds a frame.
          */
-
         scan_switch();
 
         /*
-         * 2. Read timer and switch event atomically.
+         * Take a short atomic snapshot.
+         * Switch scanning and debounce run in main context.
+         * The timer ISR only updates timer_ticks.
          */
-
         CyGlobalIntDisable;
-
         current_ticks = timer_ticks;
-
         event = switch_event;
-        switch_event = 0;
-
+        switch_event = 0u;
+        log_event = switch_log_event;
+        log_state = switch_log_state;
+        switch_log_event = 0u;
         CyGlobalIntEnable;
 
-        /*
-         * 3. Process elapsed timer ticks.
-         */
-
-        elapsed_ticks = current_ticks - previous_ticks;
-
-        previous_ticks = current_ticks;
-
-        while (elapsed_ticks > 0)
+        if (log_event)
         {
-            elapsed_ticks--;
-
-            game_tick();
+            if (log_state == 0u)
+                uart_print("SWITCH PRESSED\r\n");
+            else
+                uart_print("SWITCH RELEASED\r\n");
         }
 
-        /*
-         * 4. Change screen on one switch press.
-         */
+        elapsed_ticks = current_ticks - previous_ticks;
+        previous_ticks = current_ticks;
+
+        while (elapsed_ticks > 0u)
+        {
+            elapsed_ticks--;
+            game_tick();
+        }
 
         if (game_state == SCREEN_START && event)
         {
             reset_game();
-
             game_state = SCREEN_GAMEPLAY;
-
             uart_state("GAMEPLAY SCREEN");
         }
 
-        /*
-         * 5. Draw the current screen.
-         */
-
-        draw_current_screen();
+        /* Service completed DMA frame and prepare the next graphics frame. */
+        service_dma_graphics();
     }
 }
